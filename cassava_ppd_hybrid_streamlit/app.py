@@ -365,15 +365,22 @@ def predict_batch(bundle, history_df, variety, damage, initial, dry, harvest_hou
 
 with st.sidebar:
     st.header("Data and model")
-    data_mode = st.radio("Data source", ["Use supplied CSV files", "Load synthetic demo data"])
+    data_mode = st.radio(
+        "Data source",
+        ["Use supplied CSV files", "Load synthetic demo data", "Enter batch features manually"],
+        help="Manual entry is for a new batch. The hybrid models still need labelled training data, so this mode uses the clearly identified demo dataset for model training."
+    )
     env_file = st.file_uploader("Environmental time-series CSV", type=["csv"], disabled=data_mode != "Use supplied CSV files")
     root_file = st.file_uploader("Cassava phenotype/outcome CSV", type=["csv"], disabled=data_mode != "Use supplied CSV files")
     epochs = st.slider("Bi-LSTM training epochs", 5, 40, 15)
     train_btn = st.button("Train hybrid framework", type="primary", disabled=(data_mode == "Use supplied CSV files" and (env_file is None or root_file is None)))
 
-if data_mode == "Load synthetic demo data":
+if data_mode in ["Load synthetic demo data", "Enter batch features manually"]:
     env_df, root_df = make_demo_data()
-    st.warning("Synthetic demonstration mode is active. Model metrics from this mode are not real-world cassava PPD validation.")
+    if data_mode == "Enter batch features manually":
+        st.warning("Manual-entry mode selected. The hybrid models will be trained with the supplied synthetic demo dataset because one manually entered batch is not enough to train and validate Bi-LSTM and XGBoost. Your entered batch will then be evaluated by the trained models. Synthetic metrics are for software demonstration only.")
+    else:
+        st.warning("Synthetic demonstration mode is active. Model metrics from this mode are not real-world cassava PPD validation.")
 else:
     env_df, root_df = None, None
     if env_file is not None and root_file is not None:
@@ -393,6 +400,40 @@ if env_df is not None and root_df is not None:
     except Exception as exc:
         st.error(str(exc))
         env_df, root_df = None, None
+
+if data_mode == "Enter batch features manually":
+    st.divider()
+    st.subheader("Enter a new cassava batch")
+    st.caption("Enter the batch details here. The app will use the demo records only to train the models; these manual values are used for the new-batch prediction.")
+    with st.form("manual_batch_data_source_form"):
+        manual_batch_id = st.text_input("Batch ID", value="MANUAL-001")
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            manual_temp = st.number_input("Temperature (°C)", min_value=-10.0, max_value=60.0, value=28.0, step=0.1)
+            manual_rh = st.number_input("Relative humidity (%)", min_value=0.0, max_value=100.0, value=70.0, step=0.5)
+            manual_oxygen = st.number_input("Oxygen level (%)", min_value=0.0, max_value=100.0, value=20.9, step=0.1)
+            manual_variety = st.selectbox("Cassava variety", ["TME 419", "TMS 30572", "Local sweet", "Local bitter", "Other/unknown"])
+        with mc2:
+            manual_damage = st.slider("Mechanical damage (0 = none, 3 = severe)", 0, 3, 1)
+            manual_condition = st.selectbox("Initial root condition", ["Good", "Fair", "Poor", "Unknown"])
+            manual_dry = st.number_input("Dry matter content (%)", min_value=0.0, max_value=100.0, value=34.0, step=0.5)
+            manual_harvest_date = st.date_input("Harvest date")
+            manual_harvest_time = st.time_input("Harvest time")
+        manual_saved = st.form_submit_button("Save manual batch features")
+    if manual_saved:
+        if not manual_batch_id.strip():
+            st.error("Please enter a batch ID.")
+        else:
+            st.session_state.manual_batch_features = {
+                "batch_id": manual_batch_id.strip(), "temperature": float(manual_temp),
+                "humidity": float(manual_rh), "oxygen": float(manual_oxygen),
+                "variety": manual_variety, "damage": int(manual_damage),
+                "condition": manual_condition, "dry": float(manual_dry),
+                "harvest": pd.Timestamp.combine(manual_harvest_date, manual_harvest_time),
+            }
+            st.success("Manual batch features saved. Next, train the hybrid framework using the demo training dataset.")
+    if st.session_state.get("manual_batch_features"):
+        st.info(f"Saved manual batch: {st.session_state.manual_batch_features['batch_id']}")
 
 if "bundle" not in st.session_state:
     st.session_state.bundle = None
@@ -431,20 +472,41 @@ if bundle:
     st.dataframe(pd.DataFrame(bundle["validation_metrics"]).fillna("Not defined"), use_container_width=True)
     st.write("XGBoost held-out confusion matrix (rows = actual; columns = predicted)")
     st.dataframe(pd.DataFrame(bundle["test_confusion"], index=["Actual 0", "Actual 1"], columns=["Predicted 0", "Predicted 1"]), use_container_width=True)
-    if st.session_state.get("training_mode") == "Load synthetic demo data":
+    if st.session_state.get("training_mode") in ["Load synthetic demo data", "Enter batch features manually"]:
         st.warning("All displayed metrics are generated from synthetic records. They must not be reported as measured performance on real cassava roots.")
 
     st.divider()
     st.header("Estimate risk for a cassava batch")
     st.caption("Choose an existing batch from your data or enter a new batch manually. Both options use the same trained Bi-LSTM and XGBoost prediction pipeline.")
-    prediction_mode = st.radio(
-        "Prediction input method",
-        ["Use a batch from the loaded dataset", "Enter batch features manually"],
-        horizontal=True,
-        key="prediction_input_mode",
-    )
+    if st.session_state.get("training_mode") == "Enter batch features manually":
+        manual = st.session_state.get("manual_batch_features")
+        if manual is None:
+            st.warning("Enter and save the manual batch features above, then train the hybrid framework.")
+        else:
+            st.info("The manual batch features saved above are being used for this prediction. Oxygen is recorded but is not used by the current trained model, which was built with temperature and relative humidity only.")
+            manual_history = pd.DataFrame({
+                "timestamp": [manual["harvest"] - pd.Timedelta(hours=h) for h in range(SEQ_LEN, 0, -1)],
+                "temperature_c": [manual["temperature"]] * SEQ_LEN,
+                "relative_humidity_pct": [manual["humidity"]] * SEQ_LEN,
+            })
+            try:
+                forecast, risk = predict_batch(
+                    bundle, manual_history, manual["variety"], manual["damage"],
+                    manual["condition"], manual["dry"], manual["harvest"].hour,
+                )
+                st.session_state.last_prediction = (manual["batch_id"], forecast, risk)
+                st.caption("Assumption: the entered temperature and humidity are treated as constant across the preceding 24 hours because hourly history was not supplied.")
+            except Exception as exc:
+                st.error(f"Manual prediction failed: {exc}")
+    else:
+        prediction_mode = st.radio(
+            "Prediction input method",
+            ["Use a batch from the loaded dataset", "Enter batch features manually"],
+            horizontal=True,
+            key="prediction_input_mode",
+        )
 
-    if prediction_mode == "Use a batch from the loaded dataset":
+    if st.session_state.get("training_mode") != "Enter batch features manually" and prediction_mode == "Use a batch from the loaded dataset":
         trained_env = st.session_state.training_env
         trained_roots = st.session_state.training_roots
         selected_batch = st.selectbox("Select a batch from the loaded dataset", sorted(trained_env.batch_id.unique()))
@@ -473,7 +535,7 @@ if bundle:
             except Exception as exc:
                 st.error(f"Prediction failed: {exc}")
 
-    else:
+    elif st.session_state.get("training_mode") != "Enter batch features manually":
         st.info("Manual entry is for predicting a new batch after the hybrid model has been trained using uploaded CSV data or the supplied demo dataset.")
         st.warning("The current Bi-LSTM was trained with temperature and relative humidity. Oxygen is collected below for the batch record, but it is not yet used by this model because the supplied training dataset and trained architecture do not contain oxygen measurements.")
         with st.form("manual_batch_prediction_form"):
