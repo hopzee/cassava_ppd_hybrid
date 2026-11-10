@@ -436,48 +436,100 @@ if bundle:
 
     st.divider()
     st.header("Estimate risk for a cassava batch")
-    trained_env = st.session_state.training_env
-    trained_roots = st.session_state.training_roots
-    selected_batch = st.selectbox("Select a batch from the loaded dataset", sorted(trained_env.batch_id.unique()))
-    root_rows = trained_roots[trained_roots.batch_id == selected_batch]
-    harvest_time = pd.Timestamp(root_rows.iloc[0]["harvest_timestamp"]) if len(root_rows) else pd.NaT
-    recent = trained_env[(trained_env.batch_id == selected_batch) & (trained_env.timestamp < harvest_time)].sort_values("timestamp").tail(SEQ_LEN).copy()
-    root_row = root_rows.iloc[0] if len(root_rows) else {}
-    varieties = ["TME 419", "TMS 30572", "Local sweet", "Local bitter", "Other/unknown"]
-    conditions = ["Good", "Fair", "Poor", "Unknown"]
-    default_var = str(root_row.get("variety", "Other/unknown"))
-    default_initial = str(root_row.get("initial_condition", "Good"))
-    default_damage = int(np.clip(root_row.get("mechanical_damage", 0), 0, 3))
-    default_dry = float(np.clip(root_row.get("dry_matter_pct", 34), 0, 100))
-    default_harvest_hour = 0
-    if pd.notna(root_row.get("harvest_timestamp", pd.NaT)):
-        default_harvest_hour = int(pd.Timestamp(root_row["harvest_timestamp"]).hour)
-    with st.form("prediction_form"):
-        variety = st.selectbox("Cassava variety", varieties, index=varieties.index(default_var) if default_var in varieties else len(varieties)-1)
-        damage = st.slider("Mechanical damage indicator (0 = none, 3 = severe)", 0, 3, default_damage)
-        initial = st.selectbox("Initial root condition", conditions, index=conditions.index(default_initial) if default_initial in conditions else 0)
-        dry = st.number_input("Dry matter content (%)", 0.0, 100.0, default_dry, 0.5)
-        harvest_hour = st.number_input("Harvest time (hour of day, 0–23)", 0, 23, default_harvest_hour)
-        submitted = st.form_submit_button("Estimate 72-hour deterioration risk")
-    if submitted:
-        try:
-            forecast, risk = predict_batch(bundle, recent, variety, damage, initial, dry, harvest_hour)
-            st.subheader("Prediction result")
-            st.metric("Deterioration Risk Index (DRI)", f"{risk * 100:.1f}/100")
-            st.caption("DRI is the XGBoost model's estimated probability for the supplied binary 72-hour outcome, expressed as a percentage. It is not a universal biological scale.")
-            if risk >= 0.70:
-                st.error("Higher model-estimated risk. Prioritise inspection and consider prompt processing based on local procedures.")
-            elif risk >= 0.40:
-                st.warning("Moderate model-estimated risk. Review the batch condition and storage history.")
-            else:
-                st.success("Lower model-estimated risk relative to this trained model.")
-            forecast_df = pd.DataFrame(forecast, columns=ENV_COLS)
-            forecast_df.insert(0, "forecast_hour", np.arange(1, HORIZON + 1))
-            st.subheader("Next 72-hour environmental forecast")
-            st.line_chart(forecast_df.set_index("forecast_hour"))
-            st.download_button("Download forecast CSV", forecast_df.to_csv(index=False), "cassava_72_hour_forecast.csv", "text/csv")
-        except Exception as exc:
-            st.error(f"Prediction failed: {exc}")
+    st.caption("Choose an existing batch from your data or enter a new batch manually. Both options use the same trained Bi-LSTM and XGBoost prediction pipeline.")
+    prediction_mode = st.radio(
+        "Prediction input method",
+        ["Use a batch from the loaded dataset", "Enter batch features manually"],
+        horizontal=True,
+        key="prediction_input_mode",
+    )
+
+    if prediction_mode == "Use a batch from the loaded dataset":
+        trained_env = st.session_state.training_env
+        trained_roots = st.session_state.training_roots
+        selected_batch = st.selectbox("Select a batch from the loaded dataset", sorted(trained_env.batch_id.unique()))
+        root_rows = trained_roots[trained_roots.batch_id == selected_batch]
+        harvest_time = pd.Timestamp(root_rows.iloc[0]["harvest_timestamp"]) if len(root_rows) else pd.NaT
+        recent = trained_env[(trained_env.batch_id == selected_batch) & (trained_env.timestamp < harvest_time)].sort_values("timestamp").tail(SEQ_LEN).copy()
+        root_row = root_rows.iloc[0] if len(root_rows) else {}
+        varieties = ["TME 419", "TMS 30572", "Local sweet", "Local bitter", "Other/unknown"]
+        conditions = ["Good", "Fair", "Poor", "Unknown"]
+        default_var = str(root_row.get("variety", "Other/unknown"))
+        default_initial = str(root_row.get("initial_condition", "Good"))
+        default_damage = int(np.clip(root_row.get("mechanical_damage", 0), 0, 3))
+        default_dry = float(np.clip(root_row.get("dry_matter_pct", 34), 0, 100))
+        default_harvest_hour = int(harvest_time.hour) if pd.notna(harvest_time) else 0
+        with st.form("existing_batch_prediction_form"):
+            variety = st.selectbox("Cassava variety", varieties, index=varieties.index(default_var) if default_var in varieties else len(varieties)-1)
+            damage = st.slider("Mechanical damage indicator (0 = none, 3 = severe)", 0, 3, default_damage)
+            initial = st.selectbox("Initial root condition", conditions, index=conditions.index(default_initial) if default_initial in conditions else 0)
+            dry = st.number_input("Dry matter content (%)", 0.0, 100.0, default_dry, 0.5)
+            harvest_hour = st.number_input("Harvest time (hour of day, 0–23)", 0, 23, default_harvest_hour)
+            submitted = st.form_submit_button("Estimate 72-hour deterioration risk")
+        if submitted:
+            try:
+                forecast, risk = predict_batch(bundle, recent, variety, damage, initial, dry, harvest_hour)
+                st.session_state.last_prediction = (selected_batch, forecast, risk)
+            except Exception as exc:
+                st.error(f"Prediction failed: {exc}")
+
+    else:
+        st.info("Manual entry is for predicting a new batch after the hybrid model has been trained using uploaded CSV data or the supplied demo dataset.")
+        st.warning("The current Bi-LSTM was trained with temperature and relative humidity. Oxygen is collected below for the batch record, but it is not yet used by this model because the supplied training dataset and trained architecture do not contain oxygen measurements.")
+        with st.form("manual_batch_prediction_form"):
+            manual_batch_id = st.text_input("Batch ID", value="MANUAL-001")
+            c1, c2 = st.columns(2)
+            with c1:
+                manual_temp = st.number_input("Temperature (°C)", min_value=-10.0, max_value=60.0, value=28.0, step=0.1)
+                manual_rh = st.number_input("Relative humidity (%)", min_value=0.0, max_value=100.0, value=70.0, step=0.5)
+                manual_oxygen = st.number_input("Oxygen level (%)", min_value=0.0, max_value=100.0, value=20.9, step=0.1)
+            with c2:
+                manual_variety = st.selectbox("Cassava variety", ["TME 419", "TMS 30572", "Local sweet", "Local bitter", "Other/unknown"])
+                manual_damage = st.slider("Mechanical damage (0 = none, 3 = severe)", 0, 3, 1)
+                manual_condition = st.selectbox("Initial root condition", ["Good", "Fair", "Poor", "Unknown"])
+                manual_dry = st.number_input("Dry matter content (%)", min_value=0.0, max_value=100.0, value=34.0, step=0.5)
+            manual_harvest_date = st.date_input("Harvest date")
+            manual_harvest_time = st.time_input("Harvest time")
+            manual_submit = st.form_submit_button("Predict manually entered batch")
+        if manual_submit:
+            try:
+                if not manual_batch_id.strip():
+                    raise ValueError("Please enter a batch ID.")
+                manual_harvest = pd.Timestamp.combine(manual_harvest_date, manual_harvest_time)
+                # The trained model expects 24 hourly temperature/RH observations.
+                # A single manual reading is repeated to form a clearly disclosed constant-history input.
+                manual_history = pd.DataFrame({
+                    "timestamp": [manual_harvest - pd.Timedelta(hours=h) for h in range(SEQ_LEN, 0, -1)],
+                    "temperature_c": [manual_temp] * SEQ_LEN,
+                    "relative_humidity_pct": [manual_rh] * SEQ_LEN,
+                })
+                forecast, risk = predict_batch(
+                    bundle, manual_history, manual_variety, manual_damage,
+                    manual_condition, manual_dry, manual_harvest.hour,
+                )
+                st.session_state.last_prediction = (manual_batch_id.strip(), forecast, risk)
+                st.session_state.last_manual_oxygen = manual_oxygen
+                st.caption("Manual-input assumption: the entered temperature and humidity are treated as constant across the preceding 24 hours because a full hourly history was not supplied.")
+            except Exception as exc:
+                st.error(f"Manual prediction failed: {exc}")
+
+    if st.session_state.get("last_prediction") is not None:
+        result_batch, result_forecast, result_risk = st.session_state.last_prediction
+        st.subheader(f"Prediction result: {result_batch}")
+        st.metric("Deterioration Risk Index (DRI)", f"{result_risk * 100:.1f}/100")
+        st.caption("DRI is the XGBoost model's estimated probability for the supplied binary 72-hour outcome, expressed as a percentage. It is not a universal biological scale.")
+        if result_risk >= 0.70:
+            st.error("Higher model-estimated risk. Prioritise inspection and consider prompt processing based on local procedures.")
+        elif result_risk >= 0.40:
+            st.warning("Moderate model-estimated risk. Review the batch condition and storage history.")
+        else:
+            st.success("Lower model-estimated risk relative to this trained model.")
+        result_df = pd.DataFrame(result_forecast, columns=ENV_COLS)
+        result_df.insert(0, "forecast_hour", np.arange(1, HORIZON + 1))
+        st.subheader("Next 72-hour environmental forecast")
+        st.line_chart(result_df.set_index("forecast_hour"))
+        st.download_button("Download forecast CSV", result_df.to_csv(index=False), "cassava_72_hour_forecast.csv", "text/csv", key="download_latest_forecast")
+
 else:
     st.info("Train the hybrid framework to enable the batch prediction section.")
 
